@@ -90,7 +90,8 @@ class ListenerThread (threading.Thread):
             cb(md)
           else:
             if self.print_unhandled:
-              print "Host Side Unhandled message %02X" % mt
+              pass
+              #print "Host Side Unhandled message %02X" % mt
       except Exception, err:
         import traceback
         print traceback.format_exc()

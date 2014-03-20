@@ -25,7 +25,6 @@
 #include "track.h"
 #include "acq.h"
 #include "nmea.h"
-#include "rtcm.h"
 #include "manage.h"
 #include "timing.h"
 #include "position.h"
@@ -40,6 +39,9 @@
 #include <libswiftnav/ephemeris.h>
 #include <libswiftnav/coord_system.h>
 #include <libswiftnav/linear_algebra.h>
+#include <libswiftnav/rtcm3.h>
+#include <libswiftnav/single_diff.h>
+#include <libswiftnav/dgnss_management.h>
 
 #include <libopencm3/stm32/f4/rcc.h>
 #include <libopencm3/stm32/f4/nvic.h>
@@ -47,64 +49,16 @@
 
 #include "settings.h"
 
-#define MAX_SATS 14
+channel_measurement_t meas[MAX_CHANNELS];
+navigation_measurement_t nav_meas[MAX_CHANNELS];
+navigation_measurement_t nav_meas_old[MAX_CHANNELS];
 
-channel_measurement_t meas[MAX_SATS];
-navigation_measurement_t nav_meas[MAX_SATS];
-navigation_measurement_t nav_meas_old[MAX_SATS];
-u8 n_obs;
-
-rtcm_t rtcm;
-
-void sendrtcmnav(ephemeris_t *eph, u8 prn)
-{
-  memset(&rtcm, 0, sizeof(rtcm));
-
-	rtcm.eph = eph;
-  rtcm.prn = prn;
-  gen_rtcm3(&rtcm,1019,0);
-
-  /* Global interrupt disable to avoid concurrency/reentrancy problems. */
-  __asm__("CPSID i;");
-
-  if (settings.ftdi_usart.mode == RTCM)
-    usart_write_dma(&ftdi_tx_state, (u8 *)rtcm.buff, rtcm.nbyte);
-
-  if (settings.uarta_usart.mode == RTCM)
-    usart_write_dma(&uarta_tx_state, (u8 *)rtcm.buff, rtcm.nbyte);
-
-  if (settings.uartb_usart.mode == RTCM)
-    usart_write_dma(&uartb_tx_state, (u8 *)rtcm.buff, rtcm.nbyte);
-
-  __asm__("CPSIE i;");  /* Re-enable interrupts. */
-}
-
-void sendrtcmobs(navigation_measurement_t *obs, int nsat, gps_time_t t)
-{
-  memset(&rtcm, 0, sizeof(rtcm));
-
-	/* observation */
-	rtcm.time=t;
-	rtcm.n=nsat;
-	memcpy(rtcm.obs, obs, sizeof(navigation_measurement_t)*nsat);
-
-	/* GPS observations */
-	gen_rtcm3(&rtcm,1002,0);
-
-  /* Global interrupt disable to avoid concurrency/reentrancy problems. */
-  __asm__("CPSID i;");
-
-  if (settings.ftdi_usart.mode == RTCM)
-    usart_write_dma(&ftdi_tx_state, (u8 *)rtcm.buff, rtcm.nbyte);
-
-  if (settings.uarta_usart.mode == RTCM)
-    usart_write_dma(&uarta_tx_state, (u8 *)rtcm.buff, rtcm.nbyte);
-
-  if (settings.uartb_usart.mode == RTCM)
-    usart_write_dma(&uartb_tx_state, (u8 *)rtcm.buff, rtcm.nbyte);
-
-  __asm__("CPSIE i;");  /* Re-enable interrupts. */
-}
+navigation_measurement_t nav_meas_base[MAX_CHANNELS];
+u8 n_base;
+double tow_base = -1;
+navigation_measurement_t nav_meas_rover[MAX_CHANNELS];
+u8 n_rover;
+gps_time_t t_rover;
 
 int _getpid()
 {
@@ -122,146 +76,162 @@ int _kill(int pid, int sig)
   return -1; /* Always fails */
 }
 
-void send_observations(u8 n, navigation_measurement_t *m)
+void obs_callback(u16 sender_id, u8 len, u8 msg[], void* context)
 {
-  msg_obs_t obs;
-  for (u8 i=0; i<n; i++) {
-    obs.prn = m[i].prn;
-    obs.P = m[i].raw_pseudorange;
-    obs.L = m[i].carrier_phase;
-    obs.D = m[i].doppler;
-    obs.snr = m[i].snr;
-    obs.lock_count = 255;
-    obs.flags = 0;
-    obs.obs_n = i;
-    sbp_send_msg(MSG_OBS, sizeof(obs), (u8 *)&obs);
+  (void)sender_id; (void)len; (void) context;
+
+  /*u16 id;*/
+  /*u8 sync;*/
+  /*rtcm3_decode_1002(msg, &id, &tow_base, &n_base, nav_meas_base, &sync);*/
+
+  tow_base = ((gps_time_t *)msg)->tow;
+  n_base = (len - sizeof(gps_time_t)) / sizeof(msg_obs_t);
+  msg_obs_t *obs = (msg_obs_t *)(msg + sizeof(gps_time_t));
+  for (u8 i=0; i<n_base; i++) {
+    nav_meas_base[i].prn = obs[i].prn;
+    nav_meas_base[i].raw_pseudorange = obs[i].P;
+    nav_meas_base[i].carrier_phase = obs[i].L;
+    nav_meas_base[i].snr = obs[i].snr;
+  }
+
+  /* Ensure observations sorted by PRN. */
+  qsort(nav_meas_base, n_base, sizeof(navigation_measurement_t), nav_meas_cmp);
+
+  static u32 obs_count = 0;
+  obs_count++;
+  if (obs_count % 20 == 0) {
+    printf("Obs count: %u\n", (unsigned int)obs_count);
   }
 }
 
+void send_observations(gps_time_t t, u8 n, navigation_measurement_t *m)
+{
+  u8 buff[256];
+  /*u16 len = rtcm3_encode_1002(buff, 0, t, n, m, 0);*/
+  /*sbp_send_msg(MSG_NEW_OBS, len, buff);*/
+
+  memcpy(buff, &t, sizeof(gps_time_t));
+  msg_obs_t *obs = (msg_obs_t *)&buff[sizeof(gps_time_t)];
+  if (n * sizeof(msg_obs_t) > 255 - sizeof(gps_time_t))
+    n = 255 / sizeof(msg_obs_t);
+  for (u8 i=0; i<n; i++) {
+    obs[i].prn = m[i].prn;
+    obs[i].P = m[i].raw_pseudorange;
+    obs[i].L = m[i].carrier_phase;
+    obs[i].snr = m[i].snr;
+  }
+  sbp_send_msg(MSG_NEW_OBS, sizeof(gps_time_t) + n*sizeof(msg_obs_t), buff);
+}
+
 /* TODO: Think about thread safety when updating ephemerides. */
-ephemeris_t es[32];
-ephemeris_t es_old[32];
+ephemeris_t es[MAX_SATS];
+ephemeris_t es_old[MAX_SATS];
 
 void tim5_isr()
 {
   led_toggle(LED_RED);
 
-    /*static u32 last_tow = 0;*/
-    if (tracking_channel[0].state == TRACKING_RUNNING)
-    {
-      /*last_tow = tracking_channel[0].TOW_ms;*/
+  u8 n_ready = 0;
+  for (u8 i=0; i<nap_track_n_channels; i++) {
+    if (tracking_channel[i].state == TRACKING_RUNNING && \
+        es[tracking_channel[i].prn].valid == 1 && \
+        es[tracking_channel[i].prn].healthy == 1 && \
+        tracking_channel[i].TOW_ms > 0) {
+      __asm__("CPSID i;");
+      tracking_update_measurement(i, &meas[n_ready]);
+      __asm__("CPSIE i;");
 
-      u8 n_ready = 0;
-      for (u8 i=0; i<nap_track_n_channels; i++) {
-        if (tracking_channel[i].state == TRACKING_RUNNING && \
-            es[tracking_channel[i].prn].valid == 1 && \
-            es[tracking_channel[i].prn].healthy == 1 && \
-            tracking_channel[i].TOW_ms > 0) {
-          __asm__("CPSID i;");
-          tracking_update_measurement(i, &meas[n_ready]);
-          __asm__("CPSIE i;");
-
-          if (meas[n_ready].snr > 2)
-            n_ready++;
-        }
-      }
-
-      if (n_ready >= 4) {
-        /* Got enough sats/ephemerides, do a solution. */
-        /* TODO: Instead of passing 32 LSBs of nap_timing_count do something
-         * more intelligent with the solution time.
-         */
-        static u8 n_ready_old = 0;
-        u64 nav_tc = nap_timing_count();
-        calc_navigation_measurement(n_ready, meas, nav_meas, (double)((u32)nav_tc)/SAMPLE_FREQ, es);
-
-        navigation_measurement_t nav_meas_tdcp[MAX_SATS];
-        u8 n_ready_tdcp = tdcp_doppler(n_ready, nav_meas, n_ready_old, nav_meas_old, nav_meas_tdcp);
-
-        dops_t dops;
-        if (calc_PVT(n_ready_tdcp, nav_meas_tdcp, &position_solution, &dops) == 0) {
-          position_updated();
-
-#define SOLN_FREQ 5.0
-
-          double expected_tow = round(position_solution.time.tow*SOLN_FREQ) / SOLN_FREQ;
-          double t_err = expected_tow - position_solution.time.tow;
-
-          for (u8 i=0; i<n_ready_tdcp; i++) {
-            nav_meas_tdcp[i].pseudorange -= t_err * nav_meas_tdcp[i].doppler * (GPS_C / GPS_L1_HZ);
-            nav_meas_tdcp[i].carrier_phase += t_err * nav_meas_tdcp[i].doppler;
-            if (fabs(t_err) > 0.01)
-              printf("dphase[%d] = %f * %f = %f\n", i, t_err, nav_meas_tdcp[i].doppler, t_err * nav_meas_tdcp[i].doppler);
-          }
-          gps_time_t new_obs_time;
-          new_obs_time.wn = position_solution.time.wn;
-          new_obs_time.tow = round(position_solution.time.tow);
-
-          n_obs = n_ready_tdcp;
-
-          static u8 obs_count = 0;
-          msg_obs_hdr_t obs_hdr = { .t = new_obs_time, .count = obs_count, .n_obs = n_ready_tdcp };
-          sbp_send_msg(MSG_OBS_HDR, sizeof(obs_hdr), (u8 *)&obs_hdr);
-          send_observations(n_ready_tdcp, nav_meas_tdcp);
-          obs_count++;
-
-          double dt = expected_tow + (1/SOLN_FREQ) - position_solution.time.tow;
-
-          /* Limit dt to 2 seconds maximum to prevent hang if dt calculated incorrectly. */
-          if (dt > 2)
-            dt = 2;
-
-          timer_set_period(TIM5, round(65472000 * dt));
-
-          sbp_gps_time_t gps_time;
-          gps_time.wn = position_solution.time.wn;
-          gps_time.tow = round(position_solution.time.tow * 1e3);
-          gps_time.ns = round((position_solution.time.tow - gps_time.tow*1e-3) * 1e9);
-          gps_time.flags = 0;
-          sbp_send_msg(SBP_GPS_TIME, sizeof(gps_time), (u8 *) &gps_time);
-
-          sbp_pos_llh_t pos_llh;
-          pos_llh.tow = round(position_solution.time.tow * 1e3);
-          pos_llh.lat = position_solution.pos_llh[0] * R2D;
-          pos_llh.lon = position_solution.pos_llh[1] * R2D;
-          pos_llh.height = position_solution.pos_llh[2];
-          pos_llh.h_accuracy = 0;
-          pos_llh.v_accuracy = 0;
-          pos_llh.n_sats = n_ready_tdcp;
-          pos_llh.flags = 0;
-          sbp_send_msg(SBP_POS_LLH, sizeof(pos_llh), (u8 *) &pos_llh);
-
-          sbp_vel_ned_t vel_ned;
-          vel_ned.tow = round(position_solution.time.tow * 1e3);
-          vel_ned.n = round(position_solution.vel_ned[0] * 1e3);
-          vel_ned.e = round(position_solution.vel_ned[1] * 1e3);
-          vel_ned.d = round(position_solution.vel_ned[2] * 1e3);
-          vel_ned.h_accuracy = 0;
-          vel_ned.v_accuracy = 0;
-          vel_ned.n_sats = n_ready_tdcp;
-          vel_ned.flags = 0;
-          sbp_send_msg(SBP_VEL_NED, sizeof(vel_ned), (u8 *) &vel_ned);
-
-          nmea_gpgga(&position_solution, &dops);
-
-          sendrtcmobs(nav_meas_tdcp, n_ready_tdcp, position_solution.time);
-
-          DO_EVERY(10,
-            sbp_dops_t sbp_dops;
-            sbp_dops.pdop = round(dops.pdop * 100);
-            sbp_dops.gdop = round(dops.gdop * 100);
-            sbp_dops.tdop = round(dops.tdop * 100);
-            sbp_dops.hdop = round(dops.hdop * 100);
-            sbp_dops.vdop = round(dops.vdop * 100);
-            sbp_send_msg(SBP_DOPS, sizeof(sbp_dops_t), (u8 *) &sbp_dops);
-            nmea_gpgsv(n_ready_tdcp, nav_meas_tdcp, &position_solution);
-          );
-        }
-        memcpy(nav_meas_old, nav_meas, sizeof(nav_meas));
-        n_ready_old = n_ready;
-      }
+      if (meas[n_ready].snr > 2)
+        n_ready++;
     }
+  }
 
+  if (n_ready >= 4) {
+    /* Got enough sats/ephemerides, do a solution. */
+    /* TODO: Instead of passing 32 LSBs of nap_timing_count do something
+     * more intelligent with the solution time.
+     */
+    static u8 n_ready_old = 0;
+    u64 nav_tc = nap_timing_count();
+
+    calc_navigation_measurement(n_ready, meas, nav_meas, (double)((u32)nav_tc)/SAMPLE_FREQ, es);
+
+    n_rover = tdcp_doppler(n_ready, nav_meas, n_ready_old, nav_meas_old, nav_meas_rover);
+
+    dops_t dops;
+    if (calc_PVT(n_rover, nav_meas_rover, &position_solution, &dops) == 0) {
+      position_updated();
+
+#define SOLN_FREQ 1.0
+
+      double expected_tow = round(position_solution.time.tow*SOLN_FREQ) / SOLN_FREQ;
+      double t_err = expected_tow - position_solution.time.tow;
+
+      for (u8 i=0; i<n_rover; i++) {
+        //nav_meas_rover[i].pseudorange = gpsdifftime(nav_meas_rover[i].tot, position_solution.time) * GPS_C;
+        nav_meas_rover[i].pseudorange -= t_err * nav_meas_rover[i].doppler * (GPS_C / GPS_L1_HZ);
+        nav_meas_rover[i].carrier_phase += t_err * nav_meas_rover[i].doppler;
+        if (fabs(t_err) > 0.01)
+          printf("dphase[%d] = %f * %f = %f\n", i, t_err, nav_meas_rover[i].doppler, t_err * nav_meas_rover[i].doppler);
+      }
+      t_rover.wn = position_solution.time.wn;
+      t_rover.tow = expected_tow;
+
+      send_observations(t_rover, n_rover, nav_meas_rover);
+
+      double dt = expected_tow + (1/SOLN_FREQ) - position_solution.time.tow;
+
+      /* Limit dt to 2 seconds maximum to prevent hang if dt calculated incorrectly. */
+      if (dt > 2)
+        dt = 2;
+
+      timer_set_period(TIM5, round(65472000 * dt));
+
+      sbp_gps_time_t gps_time;
+      gps_time.wn = position_solution.time.wn;
+      gps_time.tow = round(position_solution.time.tow * 1e3);
+      gps_time.ns = round((position_solution.time.tow - gps_time.tow*1e-3) * 1e9);
+      gps_time.flags = 0;
+      sbp_send_msg(SBP_GPS_TIME, sizeof(gps_time), (u8 *) &gps_time);
+
+      sbp_pos_llh_t pos_llh;
+      pos_llh.tow = round(position_solution.time.tow * 1e3);
+      pos_llh.lat = position_solution.pos_llh[0] * R2D;
+      pos_llh.lon = position_solution.pos_llh[1] * R2D;
+      pos_llh.height = position_solution.pos_llh[2];
+      pos_llh.h_accuracy = 0;
+      pos_llh.v_accuracy = 0;
+      pos_llh.n_sats = n_rover;
+      pos_llh.flags = 0;
+      sbp_send_msg(SBP_POS_LLH, sizeof(pos_llh), (u8 *) &pos_llh);
+
+      sbp_vel_ned_t vel_ned;
+      vel_ned.tow = round(position_solution.time.tow * 1e3);
+      vel_ned.n = round(position_solution.vel_ned[0] * 1e3);
+      vel_ned.e = round(position_solution.vel_ned[1] * 1e3);
+      vel_ned.d = round(position_solution.vel_ned[2] * 1e3);
+      vel_ned.h_accuracy = 0;
+      vel_ned.v_accuracy = 0;
+      vel_ned.n_sats = n_rover;
+      vel_ned.flags = 0;
+      sbp_send_msg(SBP_VEL_NED, sizeof(vel_ned), (u8 *) &vel_ned);
+
+      nmea_gpgga(&position_solution, &dops);
+
+      DO_EVERY(10,
+        sbp_dops_t sbp_dops;
+        sbp_dops.pdop = round(dops.pdop * 100);
+        sbp_dops.gdop = round(dops.gdop * 100);
+        sbp_dops.tdop = round(dops.tdop * 100);
+        sbp_dops.hdop = round(dops.hdop * 100);
+        sbp_dops.vdop = round(dops.vdop * 100);
+        sbp_send_msg(SBP_DOPS, sizeof(sbp_dops_t), (u8 *) &sbp_dops);
+        nmea_gpgsv(n_rover, nav_meas_rover, &position_solution);
+      );
+    }
+    memcpy(nav_meas_old, nav_meas, sizeof(nav_meas));
+    n_ready_old = n_ready;
+  }
 
   timer_clear_flag(TIM5, TIM_SR_UIF);
 }
@@ -282,11 +252,45 @@ void timer_setup()
   timer_enable_irq(TIM5, TIM_DIER_UIE);
 }
 
+void send_baseline(gps_time_t t, u8 n_sats, double b_ecef[3], double ref_ecef[3])
+{
+  if (1) {
+    sbp_baseline_ecef_t sbp_ecef = {
+      .tow = t.tow,
+      .x = (s32)round(1e3 * b_ecef[0]),
+      .y = (s32)round(1e3 * b_ecef[1]),
+      .z = (s32)round(1e3 * b_ecef[2]),
+      .n_sats = n_sats,
+    };
+    sbp_send_msg(SBP_BASELINE_ECEF, sizeof(sbp_ecef), (u8 *)&sbp_ecef);
+  }
+
+  if (1) {
+    double b_ned[3];
+    wgsecef2ned(b_ecef, ref_ecef, b_ned);
+
+    sbp_baseline_ned_t sbp_ned = {
+      .tow = t.tow,
+      .n = (s32)round(1e3 * b_ned[0]),
+      .e = (s32)round(1e3 * b_ned[1]),
+      .d = (s32)round(1e3 * b_ned[2]),
+      .n_sats = n_sats,
+    };
+    sbp_send_msg(SBP_BASELINE_NED, sizeof(sbp_ned), (u8 *)&sbp_ned);
+  }
+}
+
+u8 init_done = 0;
+
+void rejig_callback(u16 sender_id, u8 len, u8 msg[], void* context)
+{
+  (void)sender_id; (void)len; (void) context;
+  init_done = msg[0];
+}
 
 int main(void)
 {
   init(1);
-
 
   printf("\n\nFirmware info - git: " GIT_VERSION ", built: " __DATE__ " " __TIME__ "\n");
   u8 nap_git_hash[20];
@@ -306,6 +310,22 @@ int main(void)
   position_setup();
   timer_setup();
 
+  static sbp_msg_callbacks_node_t rejig_node;
+
+  sbp_register_cbk(
+    0x99,
+    &rejig_callback,
+    &rejig_node
+  );
+
+  static sbp_msg_callbacks_node_t obs_node;
+
+  sbp_register_cbk(
+    MSG_NEW_OBS,
+    &obs_callback,
+    &obs_node
+  );
+
   while(1)
   {
     sbp_process_messages();
@@ -316,7 +336,7 @@ int main(void)
      * TODO: move this into a function */
 
     memcpy(es_old, es, sizeof(es));
-    for (u8 i=0; i<nap_track_n_channels; i++)
+    for (u8 i=0; i<nap_track_n_channels; i++) {
       if (tracking_channel[i].state == TRACKING_RUNNING && tracking_channel[i].nav_msg.subframe_start_index) {
         s8 ret = process_subframe(&tracking_channel[i].nav_msg, &es[tracking_channel[i].prn]);
         if (ret < 0)
@@ -336,17 +356,54 @@ int main(void)
             t.wn++;
           /*set_time(TIME_COARSE, t);*/
         }
-        if (es[tracking_channel[i].prn].valid == 1) {
-          sendrtcmnav(&es[tracking_channel[i].prn], tracking_channel[i].prn);
-        }
       }
+    }
 
+    static double ref_ecef[3] = {-2703997.584, -4262084.36, 3886179.86};
+    static double b_init[3] = {1.02571973, -0.15447333, 0.81029273}; // The antenna tree
+    /*static double b_init[3] = {0, 0, 0};*/
+
+    static double last_tow = -1;
+    if (fabs(t_rover.tow - tow_base) < 10e-3) {
+      if (tow_base != last_tow) {
+        static sdiff_t sds[MAX_CHANNELS];
+        u8 n_sds = single_diff(
+            n_rover, nav_meas_rover,
+            n_base, nav_meas_base,
+            sds
+        );
+        if (n_sds > 4) {
+          if (init_done == 0) {
+            printf("====== INIT =======\n");
+            dgnss_init(n_sds, sds, ref_ecef, 1);
+            init_done = 1;
+          }
+
+          double b[3];
+          u32 t = timer_get_counter(TIM5);
+          dgnss_update(n_sds, sds, ref_ecef, 1, b);
+          u32 dt = timer_get_counter(TIM5) - t;
+          send_baseline(t_rover, n_sds, b, ref_ecef);
+
+          printf("b_ecef: %.3f %.3f %.3f\nDT: %lu\n", b[0], b[1], b[2], dt);
+          double db[3];
+          vector_subtract(3, b, b_init, db);
+          printf("db (cm): %.3f %.3f %.3f (%.3f)\n",
+              100*db[0], 100*db[1], 100*db[2], vector_norm(3, db)*100);
+        }
+
+        last_tow = tow_base;
+      }
+    }
 
     DO_EVERY_TICKS(TICK_FREQ,
       nmea_gpgsa(tracking_channel, 0);
     );
     DO_EVERY_TICKS(TICK_FREQ/5, // 5 Hz update
       tracking_send_state();
+    );
+    DO_EVERY_TICKS(TICK_FREQ*3,
+      printf("CRC error count: %u\n", (unsigned int)crc_errors);
     );
 
     u32 err = nap_error_rd_blocking();
