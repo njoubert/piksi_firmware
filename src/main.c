@@ -59,6 +59,9 @@ double tow_base = -1;
 navigation_measurement_t nav_meas_rover[MAX_CHANNELS];
 u8 n_rover;
 gps_time_t t_rover;
+u8 SOLN_FREQ = 3;
+u8 filter_choice = 0;
+double b_init[3] = {1.02571973, -0.15447333, 0.81029273}; // The antenna tree
 
 int _getpid()
 {
@@ -162,9 +165,8 @@ void tim5_isr()
     if (calc_PVT(n_rover, nav_meas_rover, &position_solution, &dops) == 0) {
       position_updated();
 
-#define SOLN_FREQ 1.0
 
-      double expected_tow = round(position_solution.time.tow*SOLN_FREQ) / SOLN_FREQ;
+      double expected_tow = round(position_solution.time.tow*(double)SOLN_FREQ) / (double)SOLN_FREQ;
       double t_err = expected_tow - position_solution.time.tow;
 
       for (u8 i=0; i<n_rover; i++) {
@@ -179,7 +181,7 @@ void tim5_isr()
 
       send_observations(t_rover, n_rover, nav_meas_rover);
 
-      double dt = expected_tow + (1/SOLN_FREQ) - position_solution.time.tow;
+      double dt = expected_tow + (1.0/SOLN_FREQ) - position_solution.time.tow;
 
       /* Limit dt to 2 seconds maximum to prevent hang if dt calculated incorrectly. */
       if (dt > 2)
@@ -287,6 +289,24 @@ void rejig_callback(u16 sender_id, u8 len, u8 msg[], void* context)
   (void)sender_id; (void)len; (void) context;
   init_done = msg[0];
 }
+void filter_select_callback(u16 sender_id, u8 len, u8 msg[], void* context)
+{
+  (void)sender_id; (void)len; (void) context;
+  filter_choice = msg[0];
+  printf("FILTER CHANGED: %d\n", filter_choice);
+}
+void freq_set_callback(u16 sender_id, u8 len, u8 msg[], void* context)
+{
+  (void)sender_id; (void)len; (void) context;
+  SOLN_FREQ = msg[0];
+  printf("FREQ CHANGED: %d\n", SOLN_FREQ);
+}
+void set_init_b_callback(u16 sender_id, u8 len, u8 msg[], void* context)
+{
+  (void)sender_id; (void)len; (void) context;
+  memcpy(b_init, msg, 3*sizeof(double));
+  printf("B INIT CHANGED: %f, %f, %f\n", b_init[0], b_init[1], b_init[2]);
+}
 
 int main(void)
 {
@@ -311,15 +331,31 @@ int main(void)
   timer_setup();
 
   static sbp_msg_callbacks_node_t rejig_node;
-
   sbp_register_cbk(
     0x99,
     &rejig_callback,
     &rejig_node
   );
+  static sbp_msg_callbacks_node_t filter_select_node;
+  sbp_register_cbk(
+    0x98,
+    &filter_select_callback,
+    &filter_select_node
+  );
+  static sbp_msg_callbacks_node_t freq_set_node;
+  sbp_register_cbk(
+    0x97,
+    &freq_set_callback,
+    &freq_set_node
+  );
+  static sbp_msg_callbacks_node_t set_init_b_node;
+  sbp_register_cbk(
+    0x96,
+    &set_init_b_callback,
+    &set_init_b_node
+  );
 
   static sbp_msg_callbacks_node_t obs_node;
-
   sbp_register_cbk(
     MSG_NEW_OBS,
     &obs_callback,
@@ -360,7 +396,6 @@ int main(void)
     }
 
     static double ref_ecef[3] = {-2703997.584, -4262084.36, 3886179.86};
-    static double b_init[3] = {1.02571973, -0.15447333, 0.81029273}; // The antenna tree
     /*static double b_init[3] = {0, 0, 0};*/
 
     static double last_tow = -1;
@@ -375,21 +410,21 @@ int main(void)
         if (n_sds > 4) {
           if (init_done == 0) {
             printf("====== INIT =======\n");
-            dgnss_init(n_sds, sds, ref_ecef, 1);
+            dgnss_init(n_sds, sds, ref_ecef, b_init, 1.0 / SOLN_FREQ);
             init_done = 1;
           }
 
           double b[3];
-          u32 t = timer_get_counter(TIM5);
-          dgnss_update(n_sds, sds, ref_ecef, 1, b);
-          u32 dt = timer_get_counter(TIM5) - t;
+          /*u32 t = timer_get_counter(TIM5);*/
+          dgnss_update(n_sds, sds, ref_ecef, 1.0 / SOLN_FREQ, filter_choice, b);
+          /*u32 dt = timer_get_counter(TIM5) - t;*/
           send_baseline(t_rover, n_sds, b, ref_ecef);
 
-          printf("b_ecef: %.3f %.3f %.3f\nDT: %lu\n", b[0], b[1], b[2], dt);
-          double db[3];
-          vector_subtract(3, b, b_init, db);
-          printf("db (cm): %.3f %.3f %.3f (%.3f)\n",
-              100*db[0], 100*db[1], 100*db[2], vector_norm(3, db)*100);
+          /*printf("b_ecef: %.3f %.3f %.3f\nDT: %lu\n", b[0], b[1], b[2], dt);*/
+          /*double db[3];*/
+          /*vector_subtract(3, b, b_init, db);*/
+          /*printf("db (cm): %.3f %.3f %.3f (%.3f)\n",*/
+              /*100*db[0], 100*db[1], 100*db[2], vector_norm(3, db)*100);*/
         }
 
         last_tow = tow_base;

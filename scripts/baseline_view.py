@@ -19,6 +19,7 @@ from pyface.api import GUI
 
 import struct
 import math
+import time
 import os
 import numpy as np
 import datetime
@@ -81,6 +82,8 @@ class BaselineView(HasTraits):
   )
 
   init_button = Button(label='Init Ambs.')
+  init_b_button = Button(label='Set b')
+  b = Array(np.float, (3,))
 
   traits_view = View(
     HSplit(
@@ -92,6 +95,8 @@ class BaselineView(HasTraits):
           Item('zoomall_button', show_label=False),
           Item('center_button', show_label=False),
           Item('init_button', show_label=False),
+          Item('init_b_button', show_label=False),
+          Item('b', show_label=False),
         ),
         Item(
           'plot',
@@ -116,6 +121,10 @@ class BaselineView(HasTraits):
 
   def _init_button_fired(self):
     self.link.send_message(0x99, '\0')
+
+  def _init_b_button_fired(self):
+    data = struct.pack("<ddd", self.b[0], self.b[1], self.b[2])
+    self.link.send_message(0x96, data)
 
   def _clear_button_fired(self):
     self.ns = []
@@ -186,7 +195,8 @@ class BaselineView(HasTraits):
   def __init__(self, link):
     super(BaselineView, self).__init__()
 
-    self.log_file = open("baseline_log.csv", 'a')
+    self.b = np.array([1.02571973, -0.15447333, 0.81029273])
+    self.log_file = open(time.strftime("baseline_log_%Y%m%d-%H%M%S.csv"), 'w')
 
     self.plot_data = ArrayPlotData(n=[0.0], e=[0.0], d=[0.0], t=[0.0], ref_n=[0.0], ref_e=[0.0], ref_d=[0.0])
     self.plot = Plot(self.plot_data)
