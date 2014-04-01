@@ -139,6 +139,8 @@ void tim5_isr()
     if (tracking_channel[i].state == TRACKING_RUNNING && \
         es[tracking_channel[i].prn].valid == 1 && \
         es[tracking_channel[i].prn].healthy == 1 && \
+        tracking_channel[i].update_count \
+          - tracking_channel[i].snr_below_threshold_count > TRACK_SNR_THRES_COUNT && \
         tracking_channel[i].TOW_ms > 0) {
       __asm__("CPSID i;");
       tracking_update_measurement(i, &meas[n_ready]);
