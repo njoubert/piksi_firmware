@@ -83,6 +83,7 @@ class BaselineView(HasTraits):
 
   init_button = Button(label='Init Ambs.')
   init_b_button = Button(label='Set b')
+  obs_toggle_button = Button(label='Toggle observation transmission (UARTA)')
   b = Array(np.float, (3,))
 
   traits_view = View(
@@ -96,6 +97,7 @@ class BaselineView(HasTraits):
           Item('center_button', show_label=False),
           Item('init_button', show_label=False),
           Item('init_b_button', show_label=False),
+          Item('obs_toggle_button', show_label=False),
           Item('b', show_label=False),
         ),
         Item(
@@ -120,11 +122,15 @@ class BaselineView(HasTraits):
     self.running = not self.running
 
   def _init_button_fired(self):
+    #Sends message to 
     self.link.send_message(0x99, '\0')
 
   def _init_b_button_fired(self):
     data = struct.pack("<ddd", self.b[0], self.b[1], self.b[2])
     self.link.send_message(0x96, data)
+
+  def _obs_toggle_button_fired(self):
+    self.link.send_message(0x95, '\0')
 
   def _clear_button_fired(self):
     self.ns = []

@@ -89,8 +89,8 @@ class SwiftConsole(HasTraits):
       ),
     ),
     resizable = True,
-    width = 1000,
-    height = 600,
+    width = 800,
+    height = 800,
     title = 'Piksi console'
   )
 

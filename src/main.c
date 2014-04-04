@@ -60,7 +60,7 @@ navigation_measurement_t nav_meas_rover[MAX_CHANNELS];
 u8 n_rover;
 gps_time_t t_rover;
 u8 SOLN_FREQ = 3;
-u8 filter_choice = 0;
+u8 filter_choice = 1;
 double b_init[3] = {1.02571973, -0.15447333, 0.81029273}; // The antenna tree
 
 int _getpid()
@@ -288,26 +288,49 @@ u8 init_done = 0;
 
 void rejig_callback(u16 sender_id, u8 len, u8 msg[], void* context)
 {
+  //RESETS BOTH FILTERs, connected to init ambs button in console
+  //implemented in the gui code in baseline_view.py
   (void)sender_id; (void)len; (void) context;
   init_done = msg[0];
 }
 void filter_select_callback(u16 sender_id, u8 len, u8 msg[], void* context)
 {
+  //Send it either a 0 or 1 to choose fakeRTK or float
+  // 0 == stupid filter
+  // 1 == kalman float filter
   (void)sender_id; (void)len; (void) context;
   filter_choice = msg[0];
   printf("FILTER CHANGED: %d\n", filter_choice);
 }
 void freq_set_callback(u16 sender_id, u8 len, u8 msg[], void* context)
 {
+  //Changes the solution frequency
   (void)sender_id; (void)len; (void) context;
   SOLN_FREQ = msg[0];
   printf("FREQ CHANGED: %d\n", SOLN_FREQ);
 }
 void set_init_b_callback(u16 sender_id, u8 len, u8 msg[], void* context)
 {
+  //Initializes a baseline for the fakeRTK
+
   (void)sender_id; (void)len; (void) context;
   memcpy(b_init, msg, 3*sizeof(double));
   printf("B INIT CHANGED: %f, %f, %f\n", b_init[0], b_init[1], b_init[2]);
+}
+
+void set_obs_on_off_callback(u16 sender_id, u8 len, u8 msg[], void* context)
+{
+  //Turns on/off whether this piksi transmits anything on UARTA
+  (void)sender_id; (void)len; (void) context; (void) msg;
+  if (settings.uarta_usart.message_mask) {
+    settings.uarta_usart.message_mask = 0x00;
+    printf("uarta_usart.message_mask = 0x00\n");
+
+  } else {
+    settings.uarta_usart.message_mask = 0x40;
+    printf("uarta_usart.message_mask = 0x40\n");
+
+  }
 }
 
 int main(void)
@@ -355,6 +378,12 @@ int main(void)
     0x96,
     &set_init_b_callback,
     &set_init_b_node
+  );
+  static sbp_msg_callbacks_node_t set_obs_on_off_node;
+  sbp_register_cbk(
+    0x95,
+    &set_obs_on_off_callback,
+    &set_obs_on_off_node
   );
 
   static sbp_msg_callbacks_node_t obs_node;
@@ -440,7 +469,9 @@ int main(void)
       tracking_send_state();
     );
     DO_EVERY_TICKS(TICK_FREQ*3,
-      printf("CRC error count: %u\n", (unsigned int)crc_errors);
+      if (crc_errors > 0) {
+        printf("CRC error count: %u\n", (unsigned int)crc_errors);        
+      }
     );
 
     u32 err = nap_error_rd_blocking();
