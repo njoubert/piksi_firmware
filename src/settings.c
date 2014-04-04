@@ -37,6 +37,12 @@ settings_t settings /*__attribute__ ((section(".settings_area"))) */=
     .baud_rate    = 115200,
     .message_mask = 0xFF00,
   },
+  .simulation_start_ecef = {-2700303.10144031,-4292474.39651309,3855434.34087421},
+  .simulation_current_ecef = {-2700303.10144031,-4292474.39651309,3855434.34087421},
+  .simulation_mode = false,
+  .simulation_last_update_ticks = 0,
+  .simulation_wn   = 1786,
+  .simulation_tow  = 0,
 };
 
 /** \} */

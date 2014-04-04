@@ -42,7 +42,7 @@ import os
   #font.set_name("Arial")
   #fontManager.defaultFont = fontManager.findfont(font)
 
-from traits.api import Str, Instance, Dict, HasTraits, Int
+from traits.api import Str, Instance, Dict, HasTraits, Int, Button
 from traitsui.api import Item, ShellEditor, View, VSplit, HSplit, Tabbed, InstanceEditor
 
 import struct
@@ -65,6 +65,7 @@ class SwiftConsole(HasTraits):
   solution_view = Instance(SolutionView)
   baseline_view = Instance(BaselineView)
   observation_view = Instance(ObservationView)
+  simulation_mode = False;
 
   view = View(
     VSplit(
@@ -87,12 +88,25 @@ class SwiftConsole(HasTraits):
         height=0.3,
         show_label=False,
       ),
+      Item('simulator_toggle_button', show_label=False, height=20),
+
     ),
     resizable = True,
     width = 800,
     height = 800,
     title = 'Piksi console'
   )
+
+  simulator_toggle_button = Button(label='Toggle hardware\'s simulation mode')
+
+  def _simulator_toggle_button_fired(self):
+    self.simulation_mode = not(self.simulation_mode)
+    if (self.simulation_mode):
+      print "Requesting piksi to enter simulation mode"
+    else:
+      print "Requesting piksi to exit simulation mode"
+    data = struct.pack("<?", self.simulation_mode)
+    self.link.send_message(0x94, data)
 
   def print_message_callback(self, data):
     try:

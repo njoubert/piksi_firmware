@@ -39,6 +39,13 @@ typedef struct {
   usart_settings_t ftdi_usart;
   usart_settings_t uarta_usart;
   usart_settings_t uartb_usart;
+  //Simulator-related globals
+  u8      simulation_mode;  //0 == off, 1 == PVT only, 2 == PVT & Baseline
+  u32     simulation_last_update_ticks;
+  u16     simulation_wn;
+  u32     simulation_tow;
+  double simulation_start_ecef[3];
+  double simulation_current_ecef[3];
 } settings_t;
 
 /** \} */

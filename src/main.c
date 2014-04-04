@@ -191,6 +191,7 @@ void tim5_isr()
 
       timer_set_period(TIM5, round(65472000 * dt));
 
+      if (!settings.simulation_mode) {
       sbp_gps_time_t gps_time;
       gps_time.wn = position_solution.time.wn;
       gps_time.tow = round(position_solution.time.tow * 1e3);
@@ -232,9 +233,91 @@ void tim5_isr()
         sbp_send_msg(SBP_DOPS, sizeof(sbp_dops_t), (u8 *) &sbp_dops);
         nmea_gpgsv(n_rover, nav_meas_rover, &position_solution);
       );
+      }
     }
     memcpy(nav_meas_old, nav_meas, sizeof(nav_meas));
     n_ready_old = n_ready;
+  }
+
+  //Here we do all the nice simulation-related stuff.
+  if (settings.simulation_mode > 0) {
+
+    //Set the timer period appropriately
+    timer_set_period(TIM5, round(65472000 * (1.0/SOLN_FREQ)));
+
+    //First we propagate the current fake PVT solution
+    u32 now_ticks = time_ticks();
+    if (settings.simulation_last_update_ticks == 0) {
+
+      //If this is the first time we see this, just set our tick count.
+      //This prevents a big jump at the first message.
+      settings.simulation_last_update_ticks = now_ticks;
+
+    } else {
+      
+      double elapsed_seconds = (now_ticks - settings.simulation_last_update_ticks)/(double)TICK_FREQ;
+      settings.simulation_last_update_ticks = now_ticks;
+
+      settings.simulation_tow += 1000.0*elapsed_seconds;
+
+      double vel_ned_given[3] = {1.0,0.0,0.0};
+      double vel_ecef[3];
+      wgsned2ecef(vel_ned_given, settings.simulation_current_ecef, vel_ecef);
+
+      settings.simulation_current_ecef[0] += vel_ecef[0]*elapsed_seconds;
+      settings.simulation_current_ecef[1] += vel_ecef[1]*elapsed_seconds;
+      settings.simulation_current_ecef[2] += vel_ecef[2]*elapsed_seconds;
+
+      double current_pos_llh[3];
+      wgsecef2llh(settings.simulation_current_ecef, current_pos_llh);
+      current_pos_llh[0] = current_pos_llh[0]*R2D;
+      current_pos_llh[1] = current_pos_llh[1]*R2D;
+
+      //Then we send fake messages
+
+      sbp_gps_time_t gps_time;
+      gps_time.wn = settings.simulation_wn;
+      gps_time.tow = settings.simulation_tow;
+      gps_time.ns = 0;
+      gps_time.flags = 0;
+      sbp_send_msg(SBP_GPS_TIME, sizeof(gps_time), (u8 *) &gps_time);
+
+      sbp_pos_llh_t pos_llh;
+      pos_llh.tow = settings.simulation_tow;
+      pos_llh.lat = current_pos_llh[0];
+      pos_llh.lon = current_pos_llh[1];
+      pos_llh.height = current_pos_llh[2];
+      pos_llh.h_accuracy = 0;
+      pos_llh.v_accuracy = 0;
+      pos_llh.n_sats = 9;
+      pos_llh.flags = 0;
+      sbp_send_msg(SBP_POS_LLH, sizeof(pos_llh), (u8 *) &pos_llh);
+
+      sbp_vel_ned_t vel_ned;
+      vel_ned.tow = settings.simulation_tow;
+      vel_ned.n = (s32) vel_ned_given[0]*1000;
+      vel_ned.e = (s32) vel_ned_given[1]*1000;
+      vel_ned.d = (s32) vel_ned_given[2]*1000;
+      vel_ned.h_accuracy = 0;
+      vel_ned.v_accuracy = 0;
+      vel_ned.n_sats = 9;
+      vel_ned.flags = 0;
+      sbp_send_msg(SBP_VEL_NED, sizeof(vel_ned), (u8 *) &vel_ned);
+
+      DO_EVERY(10,
+        sbp_dops_t sbp_dops;
+        sbp_dops.pdop = round(1.9 * 100);
+        sbp_dops.gdop = round(1.8 * 100);
+        sbp_dops.tdop = round(1.7 * 100);
+        sbp_dops.hdop = round(1.6 * 100);
+        sbp_dops.vdop = round(1.5 * 100);
+        sbp_send_msg(SBP_DOPS, sizeof(sbp_dops_t), (u8 *) &sbp_dops);
+      );
+
+
+    }
+
+
   }
 
   timer_clear_flag(TIM5, TIM_SR_UIF);
@@ -284,6 +367,10 @@ void send_baseline(gps_time_t t, u8 n_sats, double b_ecef[3], double ref_ecef[3]
   }
 }
 
+
+//********************************************************************
+// Hacky settings - should be replaced by proper settings subsystem
+//********************************************************************
 u8 init_done = 0;
 
 void rejig_callback(u16 sender_id, u8 len, u8 msg[], void* context)
@@ -332,6 +419,23 @@ void set_obs_on_off_callback(u16 sender_id, u8 len, u8 msg[], void* context)
 
   }
 }
+
+void set_simulation_mode_callback(u16 sender_id, u8 len, u8 msg[], void* context)
+{
+  //Turns simulation mode on/off
+  (void)sender_id; (void)len; (void) context;
+  settings.simulation_mode = msg[0];
+  if (settings.simulation_mode > 0) {
+    led_on(LED_GREEN);
+  } else {
+    led_off(LED_GREEN);
+  }
+  printf("Simulation Mode: %d\n", settings.simulation_mode);
+
+}
+//********************************************************************
+// END Hacky settings
+//********************************************************************
 
 int main(void)
 {
@@ -391,6 +495,13 @@ int main(void)
     MSG_NEW_OBS,
     &obs_callback,
     &obs_node
+  );
+
+  static sbp_msg_callbacks_node_t set_simulation_mode_node;
+  sbp_register_cbk(
+    0x94,
+    &set_simulation_mode_callback,
+    &set_simulation_mode_node
   );
 
   while(1)
@@ -472,6 +583,7 @@ int main(void)
       if (crc_errors > 0) {
         printf("CRC error count: %u\n", (unsigned int)crc_errors);        
       }
+      crc_errors = 0;
     );
 
     u32 err = nap_error_rd_blocking();
