@@ -48,6 +48,7 @@
 #include <libopencm3/stm32/f4/timer.h>
 
 #include "settings.h"
+#include "simulator.h"
 
 channel_measurement_t meas[MAX_CHANNELS];
 navigation_measurement_t nav_meas[MAX_CHANNELS];
@@ -191,7 +192,7 @@ void tim5_isr()
 
       timer_set_period(TIM5, round(65472000 * dt));
 
-      if (!settings.simulation_mode) {
+      if (!simulation_state.mode) {
       sbp_gps_time_t gps_time;
       gps_time.wn = position_solution.time.wn;
       gps_time.tow = round(position_solution.time.tow * 1e3);
@@ -240,83 +241,87 @@ void tim5_isr()
   }
 
   //Here we do all the nice simulation-related stuff.
-  if (settings.simulation_mode > 0) {
+  if (simulation_state.mode > 0) {
 
     //Set the timer period appropriately
     timer_set_period(TIM5, round(65472000 * (1.0/SOLN_FREQ)));
 
     //First we propagate the current fake PVT solution
     u32 now_ticks = time_ticks();
-    if (settings.simulation_last_update_ticks == 0) {
+    
+    double elapsed_seconds = (now_ticks - simulation_state.last_update_ticks)/(double)TICK_FREQ;
+    simulation_state.last_update_ticks = now_ticks;
 
-      //If this is the first time we see this, just set our tick count.
-      //This prevents a big jump at the first message.
-      settings.simulation_last_update_ticks = now_ticks;
+    //Update the time
+    simulation_state.tow += 1000.0*elapsed_seconds;
 
-    } else {
-      
-      double elapsed_seconds = (now_ticks - settings.simulation_last_update_ticks)/(double)TICK_FREQ;
-      settings.simulation_last_update_ticks = now_ticks;
-
-      settings.simulation_tow += 1000.0*elapsed_seconds;
-
-      double vel_ned_given[3] = {1.0,0.0,0.0};
-      double vel_ecef[3];
-      wgsned2ecef(vel_ned_given, settings.simulation_current_ecef, vel_ecef);
-
-      settings.simulation_current_ecef[0] += vel_ecef[0]*elapsed_seconds;
-      settings.simulation_current_ecef[1] += vel_ecef[1]*elapsed_seconds;
-      settings.simulation_current_ecef[2] += vel_ecef[2]*elapsed_seconds;
-
-      double current_pos_llh[3];
-      wgsecef2llh(settings.simulation_current_ecef, current_pos_llh);
-      current_pos_llh[0] = current_pos_llh[0]*R2D;
-      current_pos_llh[1] = current_pos_llh[1]*R2D;
-
-      //Then we send fake messages
-
-      sbp_gps_time_t gps_time;
-      gps_time.wn = settings.simulation_wn;
-      gps_time.tow = settings.simulation_tow;
-      gps_time.ns = 0;
-      gps_time.flags = 0;
-      sbp_send_msg(SBP_GPS_TIME, sizeof(gps_time), (u8 *) &gps_time);
-
-      sbp_pos_llh_t pos_llh;
-      pos_llh.tow = settings.simulation_tow;
-      pos_llh.lat = current_pos_llh[0];
-      pos_llh.lon = current_pos_llh[1];
-      pos_llh.height = current_pos_llh[2];
-      pos_llh.h_accuracy = 0;
-      pos_llh.v_accuracy = 0;
-      pos_llh.n_sats = 9;
-      pos_llh.flags = 0;
-      sbp_send_msg(SBP_POS_LLH, sizeof(pos_llh), (u8 *) &pos_llh);
-
-      sbp_vel_ned_t vel_ned;
-      vel_ned.tow = settings.simulation_tow;
-      vel_ned.n = (s32) vel_ned_given[0]*1000;
-      vel_ned.e = (s32) vel_ned_given[1]*1000;
-      vel_ned.d = (s32) vel_ned_given[2]*1000;
-      vel_ned.h_accuracy = 0;
-      vel_ned.v_accuracy = 0;
-      vel_ned.n_sats = 9;
-      vel_ned.flags = 0;
-      sbp_send_msg(SBP_VEL_NED, sizeof(vel_ned), (u8 *) &vel_ned);
-
-      DO_EVERY(10,
-        sbp_dops_t sbp_dops;
-        sbp_dops.pdop = round(1.9 * 100);
-        sbp_dops.gdop = round(1.8 * 100);
-        sbp_dops.tdop = round(1.7 * 100);
-        sbp_dops.hdop = round(1.6 * 100);
-        sbp_dops.vdop = round(1.5 * 100);
-        sbp_send_msg(SBP_DOPS, sizeof(sbp_dops_t), (u8 *) &sbp_dops);
-      );
-
-
+    //Update the angle, making a small angle approximation.
+    simulation_state.current_angle_rad += (simulation_state.speed * elapsed_seconds) / simulation_state.radius;
+    if (simulation_state.current_angle_rad > 2*M_PI) {
+      simulation_state.current_angle_rad = 0;
     }
 
+    double pos_ned[3] = { 
+      simulation_state.radius * sin(simulation_state.current_angle_rad) + generateGaussianNoise(simulation_state.pos_variance),
+      simulation_state.radius * cos(simulation_state.current_angle_rad) + generateGaussianNoise(simulation_state.pos_variance), 
+      generateGaussianNoise(simulation_state.pos_variance)
+    };
+    double current_pos_ecef[3];
+    wgsned2ecef_d(pos_ned, simulation_state.center_ecef, current_pos_ecef);
+    
+    double current_pos_llh[3];
+    wgsecef2llh(current_pos_ecef, current_pos_llh);
+
+    //Velocity vector tangent to the sphere
+    double noisy_speed = simulation_state.speed + generateGaussianNoise(simulation_state.speed_variance);
+    double current_vel_ned[3] = {
+      noisy_speed * cos(simulation_state.current_angle_rad),
+      -1.0 * noisy_speed * sin(simulation_state.current_angle_rad),
+      0.0
+    };
+
+    printf("velocity ned %f %f %f\n", current_vel_ned[0], current_vel_ned[1], current_vel_ned[2]);
+
+    //Then we send fake messages
+
+    sbp_gps_time_t gps_time;
+    gps_time.wn = simulation_state.wn;
+    gps_time.tow = simulation_state.tow;
+    gps_time.ns = 0;
+    gps_time.flags = 0;
+    sbp_send_msg(SBP_GPS_TIME, sizeof(gps_time), (u8 *) &gps_time);
+
+    sbp_pos_llh_t pos_llh;
+    pos_llh.tow = simulation_state.tow;
+    pos_llh.lat = current_pos_llh[0]*R2D;
+    pos_llh.lon = current_pos_llh[1]*R2D;
+    pos_llh.height = current_pos_llh[2];
+    pos_llh.h_accuracy = 0;
+    pos_llh.v_accuracy = 0;
+    pos_llh.n_sats = 9;
+    pos_llh.flags = 0;
+    sbp_send_msg(SBP_POS_LLH, sizeof(pos_llh), (u8 *) &pos_llh);
+
+    sbp_vel_ned_t vel_ned;
+    vel_ned.tow = simulation_state.tow;
+    vel_ned.n = (s32) (current_vel_ned[0]*1e3);
+    vel_ned.e = (s32) (current_vel_ned[1]*1e3);
+    vel_ned.d = (s32) (current_vel_ned[2]*1e3);
+    vel_ned.h_accuracy = 0;
+    vel_ned.v_accuracy = 0;
+    vel_ned.n_sats = 9;
+    vel_ned.flags = 0;
+    sbp_send_msg(SBP_VEL_NED, sizeof(vel_ned), (u8 *) &vel_ned);
+
+    DO_EVERY(10,
+      sbp_dops_t sbp_dops;
+      sbp_dops.pdop = round(1.9 * 1e2);
+      sbp_dops.gdop = round(1.8 * 1e2);
+      sbp_dops.tdop = round(1.7 * 1e2);
+      sbp_dops.hdop = round(1.6 * 1e2);
+      sbp_dops.vdop = round(1.5 * 1e2);
+      sbp_send_msg(SBP_DOPS, sizeof(sbp_dops_t), (u8 *) &sbp_dops);
+    );
 
   }
 
@@ -424,13 +429,13 @@ void set_simulation_mode_callback(u16 sender_id, u8 len, u8 msg[], void* context
 {
   //Turns simulation mode on/off
   (void)sender_id; (void)len; (void) context;
-  settings.simulation_mode = msg[0];
-  if (settings.simulation_mode > 0) {
+  simulation_state.mode = msg[0];
+  if (simulation_state.mode > 0) {
     led_on(LED_GREEN);
   } else {
     led_off(LED_GREEN);
   }
-  printf("Simulation Mode: %d\n", settings.simulation_mode);
+  printf("Simulation Mode: %d\n", simulation_state.mode);
 
 }
 //********************************************************************
